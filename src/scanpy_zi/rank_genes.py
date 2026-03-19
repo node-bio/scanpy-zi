@@ -265,7 +265,7 @@ def rank_genes_groups_zi(
         # =====================================================================
         # AMPLITUDE: OLS regression among expressors
         # =====================================================================
-        MIN_CELLS_FOR_TEST = 3
+        MIN_CELLS_FOR_TEST = min_cells
 
         n_expr_a = n_expressors_a.astype(np.float32)
         n_expr_b = n_expressors_b.astype(np.float32)
