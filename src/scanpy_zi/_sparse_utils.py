@@ -1,122 +1,107 @@
-"""Sparse-native utility functions for memory-efficient computation."""
+"""Per-group sufficient statistics computed in one pass over the expression matrix."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
+import scipy.sparse as sp
 from numpy.typing import NDArray
 
+# Target number of stored values processed per chunk. Bounds temporary memory
+# (a few float64/int64 arrays of this length) independent of matrix size.
+_CHUNK_NNZ = 10_000_000
 
-def sparse_expr_stats(
-    X_csc, threshold: float
-) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
-    """Compute mean and SS residuals directly from CSC sparse matrix.
 
-    This function processes sparse matrices column-by-column without
-    materializing dense arrays, enabling memory-efficient computation
-    on large single-cell datasets.
+@dataclass
+class GroupStats:
+    """Sufficient statistics per group code (rows) and gene (columns).
 
-    Expects input to already be normalized and log-transformed.
+    Only values strictly above the expression threshold contribute.
+    """
+
+    n_cells: NDArray[np.float64]  # (n_codes,)
+    n_expr: NDArray[np.float64]  # (n_codes, n_genes) count of expressing cells
+    sum_expr: NDArray[np.float64]  # (n_codes, n_genes) sum of values among expressors
+    sumsq_expr: NDArray[np.float64]  # (n_codes, n_genes) sum of squared values among expressors
+
+
+def group_expr_stats(X, codes: NDArray[np.integer], n_codes: int, threshold: float) -> GroupStats:
+    """Aggregate expressor counts, sums and sums of squares per group and gene.
+
+    Runs a single pass over the stored values of ``X`` (never densifies a
+    sparse matrix), accumulating with ``np.bincount`` in float64.
 
     Parameters
     ----------
-    X_csc
-        Sparse matrix in CSC format (cells x genes). Should contain
-        normalized, log-transformed expression values.
+    X
+        Cells x genes matrix, sparse or dense. Values are used as given.
+    codes
+        Group code for each cell, in ``[0, n_codes)``.
+    n_codes
+        Number of distinct codes.
     threshold
-        Expression threshold above which a cell is considered expressing.
-
-    Returns
-    -------
-    mean_expr
-        Mean expression for x > threshold, per gene.
-    ss_resid
-        Sum of squared residuals from mean, per gene.
-    n_expr
-        Count of expressors per gene.
+        A value counts as expressing when it is strictly greater than this.
+        Must be >= 0 so that implicit zeros are never expressing.
     """
-    n_genes = X_csc.shape[1]
-    mean_expr = np.zeros(n_genes, dtype=np.float32)
-    ss_resid = np.zeros(n_genes, dtype=np.float32)
-    n_expr = np.zeros(n_genes, dtype=np.float32)
+    n_cells, n_genes = X.shape
+    codes = np.asarray(codes, dtype=np.int64)
+    size = n_codes * n_genes
 
-    for j in range(n_genes):
-        start, end = X_csc.indptr[j], X_csc.indptr[j + 1]
-        col_data = X_csc.data[start:end]
+    n_expr = np.zeros(size, dtype=np.float64)
+    sum_expr = np.zeros(size, dtype=np.float64)
+    sumsq_expr = np.zeros(size, dtype=np.float64)
 
-        # Filter by threshold
-        expr_mask = col_data > threshold
-        expr_vals = col_data[expr_mask].astype(np.float32)
-        n = len(expr_vals)
-        n_expr[j] = n
+    def _accumulate(row_codes, cols, vals):
+        keep = vals > threshold
+        vals = vals[keep].astype(np.float64)
+        idx = row_codes[keep] * n_genes + cols[keep]
+        n_expr[:] += np.bincount(idx, minlength=size)
+        sum_expr[:] += np.bincount(idx, weights=vals, minlength=size)
+        sumsq_expr[:] += np.bincount(idx, weights=vals * vals, minlength=size)
 
-        if n > 0:
-            mean_expr[j] = np.mean(expr_vals)
-            if n > 1:
-                ss_resid[j] = np.sum((expr_vals - mean_expr[j]) ** 2)
+    if sp.issparse(X):
+        X = sp.csr_matrix(X)  # no copy if already CSR
+        if not X.has_canonical_format:
+            X = X.copy()
+            X.sum_duplicates()
+        indptr = X.indptr
+        avg_nnz = max(X.nnz / max(n_cells, 1), 1.0)
+        step = max(int(_CHUNK_NNZ / avg_nnz), 1)
+        for start in range(0, n_cells, step):
+            end = min(start + step, n_cells)
+            lo, hi = indptr[start], indptr[end]
+            row_codes = np.repeat(codes[start:end], np.diff(indptr[start : end + 1]))
+            _accumulate(row_codes, X.indices[lo:hi].astype(np.int64), X.data[lo:hi])
+    else:
+        step = max(int(_CHUNK_NNZ / max(n_genes, 1)), 1)
+        for start in range(0, n_cells, step):
+            block = np.asarray(X[start : start + step])
+            rows, cols = np.nonzero(block > threshold)
+            _accumulate(codes[start + rows], cols.astype(np.int64), block[rows, cols])
 
-    return mean_expr, ss_resid, n_expr
+    shape = (n_codes, n_genes)
+    return GroupStats(
+        n_cells=np.bincount(codes, minlength=n_codes).astype(np.float64),
+        n_expr=n_expr.reshape(shape),
+        sum_expr=sum_expr.reshape(shape),
+        sumsq_expr=sumsq_expr.reshape(shape),
+    )
 
 
-def sparse_influence_covariance(
-    X_csc,
-    theta: NDArray[np.float32],
-    mean_expr: NDArray[np.float32],
-    n_cells: int,
-    n_expr: NDArray[np.float32],
-    threshold: float,
-) -> NDArray[np.float32]:
-    """Compute influence function covariance from CSC sparse matrix.
-
-    For each cell i and gene j:
-        ψ_π[i,j] = (express[i,j] - θ[j]) / (θ[j]*(1-θ[j])) / n_cells
-        ψ_μ[i,j] = (expr[i,j] - mean[j]) / n_expr[j] for expressors, 0 otherwise
-
-    Expects input to already be normalized and log-transformed.
-
-    Parameters
-    ----------
-    X_csc
-        Sparse matrix in CSC format (cells x genes). Should contain
-        normalized, log-transformed expression values.
-    theta
-        Fraction of expressing cells per gene.
-    mean_expr
-        Mean expression among expressors per gene.
-    n_cells
-        Total number of cells.
-    n_expr
-        Number of expressing cells per gene.
-    threshold
-        Expression threshold.
-
-    Returns
-    -------
-    cov_pi_mu
-        Covariance = sum_i(ψ_π * ψ_μ) per gene.
-    """
-    n_genes = X_csc.shape[1]
-    cov_pi_mu = np.zeros(n_genes, dtype=np.float32)
-
-    for j in range(n_genes):
-        if theta[j] <= 0 or theta[j] >= 1 or n_expr[j] < 1:
-            continue
-
-        inv_var = 1.0 / (theta[j] * (1 - theta[j]) + 1e-10)
-        start, end = X_csc.indptr[j], X_csc.indptr[j + 1]
-        col_data = X_csc.data[start:end]
-
-        # For expressors: both ψ_π and ψ_μ are non-zero
-        expr_mask = col_data > threshold
-        expr_vals = col_data[expr_mask].astype(np.float32)
-        n = len(expr_vals)
-
-        if n > 0:
-            # ψ_π for expressors: (1 - θ) * inv_var / n_cells
-            psi_pi_expr = (1 - theta[j]) * inv_var / n_cells
-            # ψ_μ for expressors: (expr_val - mean) / n_expr
-            psi_mu_expr = (expr_vals - mean_expr[j]) / (n_expr[j] + 1e-10)
-            cov_pi_mu[j] = np.sum(psi_pi_expr * psi_mu_expr) * n_cells
-
-        # Non-expressors contribute to ψ_π but ψ_μ = 0, so no contribution to cov
-
-    return cov_pi_mu
+def benjamini_hochberg(pvals: NDArray[np.floating]) -> NDArray[np.float64]:
+    """Benjamini-Hochberg adjusted p-values. Non-finite inputs are returned as 1."""
+    pvals = np.asarray(pvals, dtype=np.float64)
+    adj = np.ones_like(pvals)
+    valid = np.isfinite(pvals)
+    p = pvals[valid]
+    m = p.size
+    if m == 0:
+        return adj
+    order = np.argsort(p)
+    ranked = p[order] * m / np.arange(1, m + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    out = np.empty(m)
+    out[order] = np.clip(ranked, 0.0, 1.0)
+    adj[valid] = out
+    return adj
