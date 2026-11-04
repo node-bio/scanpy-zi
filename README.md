@@ -33,7 +33,7 @@ scanpy-zi separates differential expression into two components:
 | Effect | Measures | Statistic |
 |--------|----------|-----------|
 | **Δπ** (penetrance) | Change in fraction expressing | Log-odds ratio |
-| **Δμ** (amplitude) | Change in expression level | Log fold change among expressors |
+| **Δμ** (amplitude) | Change in expression level | Difference in mean (log-scale) expression among expressors |
 
 Each component has a separate effect size, confidence interval, and p-value. A joint Wald test provides overall significance while preserving the decomposition.
 
@@ -61,13 +61,18 @@ adata = sc.read_h5ad("your_data.h5ad")
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 
+# All groups vs rest (one pass over the matrix)
 results = scanpy_zi.rank_genes_groups_zi(
     adata,
     groupby="celltype",
-    groups=["T cells"],
     reference="rest",
     use_raw=False,
     copy=True,
+)
+
+# Or a single group
+results = scanpy_zi.rank_genes_groups_zi(
+    adata, groupby="celltype", groups=["T cells"], use_raw=False, copy=True
 )
 
 # Top genes by combined significance
@@ -94,13 +99,29 @@ scanpy_zi.pl.zi_decomposition(adata)
 | `delta_pi_ci_lower` | 95% CI lower bound |
 | `delta_pi_ci_upper` | 95% CI upper bound |
 | `pvals_pi_adj` | FDR-adjusted p-value for penetrance |
-| `delta_mu` | Amplitude effect (log FC among expressors) |
+| `delta_mu` | Amplitude effect: difference in mean input value among expressors (input units, see below) |
 | `se_delta_mu` | Standard error of amplitude |
 | `delta_mu_ci_lower` | 95% CI lower bound |
 | `delta_mu_ci_upper` | 95% CI upper bound |
 | `pvals_mu_adj` | FDR-adjusted p-value for amplitude |
 | `pvals_adj` | Combined FDR-adjusted p-value (Wald test) |
 | `combined_z` | Combined z-score: z_π + z_μ (signed) |
+| `wald_statistic` | z_π² + z_μ² (χ², 2 df) |
+| `pct_nz_group`, `pct_nz_reference` | Fraction of cells expressing |
+
+Rows are sorted within each group by combined p-value.
+
+## Input expectations
+
+Values are used exactly as given; scanpy-zi applies no transform. Pass normalized,
+log-transformed data (for example `sc.pp.normalize_total` then `sc.pp.log1p`) and do not
+log-transform again before calling. A warning is raised if the input looks like raw integer
+counts.
+
+`delta_mu` (and its alias `logfoldchanges`) is in the units of the input. For `sc.pp.log1p`
+output that is natural log: `delta_mu` is the difference in mean ln(1 + x) among expressing
+cells. Divide by ln(2) ≈ 0.693 for log2 units. It is not the log of a ratio of mean expression,
+which is what `sc.tl.rank_genes_groups` reports as `logfoldchanges`.
 
 ## Group-vs-rest comparisons
 
@@ -114,16 +135,19 @@ The limitation is interpretive: group-vs-rest cannot distinguish whether a marke
 
 **Penetrance**: Log-odds ratio from the 2×2 contingency table (expressing/non-expressing × group/reference). Haldane correction (+0.5) applied when any cell count is zero.
 
-**Amplitude**: Mean difference among expressing cells. Input should be log-normalized, so this is a log fold change.
+**Amplitude**: Mean difference among expressing cells, tested with a pooled-variance two-sample t-test (equivalent to OLS on a group indicator).
 
-**Combined test**: Penetrance and amplitude estimators are correlated. We estimate their joint covariance using influence functions and compute a multivariate Wald statistic (χ² with 2 df).
+**Combined test**: Wald statistic W = z_π² + z_μ², χ² with 2 df (1 df when only one component is testable). The two estimators are uncorrelated: within a group, penetrance depends only on the number of expressing cells N, and given N the mean among expressors is unbiased, so their covariance is zero by the law of total covariance. No correlation term is needed.
 
-**Implementation**: Sparse-native throughout. The expression matrix is never densified.
+**Filtering (`min_cells`)**: Amplitude requires at least `min_cells` expressing cells in each group. Penetrance requires at least `min_cells` expressing cells in the two groups combined, so genes that are on in one group and off in the other are still tested. Untestable components get p-value 1. Amplitude is also untestable when every expressing cell has the same value (zero variance).
+
+**Implementation**: One pass over the stored values of the matrix aggregates expressor counts, sums and sums of squares for every requested group at once (float64, `np.bincount`). "Rest" statistics are totals minus the group. All per-gene statistics are vectorized. The matrix is never densified or copied; on a 46k-cell × 16.6k-gene matrix (73M non-zeros) all 35 groups vs rest take about 2 s.
 
 ### Limitations
 
-- Amplitude is undefined for genes with no expressors in either group (reported as `NaN`).
-- Covariance estimation is unstable for genes with penetrance near 0 or 1. Correlation is clipped to [-0.99, 0.99].
+- Amplitude is undefined for genes with fewer than `min_cells` expressors in either group (reported as `NaN`).
+- When a gene has zero expressors (or zero non-expressors) in a group, the Haldane-corrected log-odds has a wide standard error, so on/off markers get moderate rather than extreme penetrance p-values.
+- The amplitude test assumes equal variance among expressors in the two groups. With group-vs-rest comparisons the reference is a mixture and may be more variable.
 - Input should be log-normalized. Count data should be normalized before analysis.
 - The decomposition assumes zeros represent non-expression. For genes with substantial technical dropout, penetrance estimates will be attenuated.
 

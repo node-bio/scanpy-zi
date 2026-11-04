@@ -231,7 +231,9 @@ def zi_decomposition(
                 zorder=10,
             )
 
-        ax_scatter.set_xlabel("Δμ (Amplitude: log2 FC among expressors)", fontsize=11)
+        ax_scatter.set_xlabel(
+            "Δμ (amplitude: mean difference among expressors, input units)", fontsize=11
+        )
         ax_scatter.set_ylabel("Log-Odds Ratio (Penetrance)", fontsize=11)
         ax_scatter.set_title(
             "Zero-Inflated Decomposition\n(point size ∝ precision)", fontsize=13, fontweight="bold"
@@ -310,7 +312,7 @@ def zi_decomposition(
         ax_forest_mu.axvline(0, color="black", linestyle="-", linewidth=1, alpha=0.7)
         ax_forest_mu.set_yticks(y_positions)
         ax_forest_mu.set_yticklabels(gene_names, fontsize=8)
-        ax_forest_mu.set_xlabel("Δμ (log FC) ± 95% CI", fontsize=10)
+        ax_forest_mu.set_xlabel("Δμ (input units) ± 95% CI", fontsize=10)
         ax_forest_mu.set_title("Amplitude Forest Plot", fontsize=12, fontweight="bold")
         ax_forest_mu.grid(axis="x", alpha=0.3)
 
@@ -336,9 +338,9 @@ def zi_decomposition(
             )
 
         ax_forest_joint.axvline(0, color="black", linestyle="-", linewidth=1, alpha=0.7)
-        # Reference lines at ±2.77 ≈ 1.96*sqrt(2) for independent z-scores (rho=0)
+        # Reference lines at ±2.77 ≈ 1.96*sqrt(2): z_pi and z_mu are independent
         ax_forest_joint.axvline(
-            2.77, color="green", linestyle="--", linewidth=1, alpha=0.5, label="p≈0.05 (ρ=0)"
+            2.77, color="green", linestyle="--", linewidth=1, alpha=0.5, label="p≈0.05"
         )
         ax_forest_joint.axvline(-2.77, color="green", linestyle="--", linewidth=1, alpha=0.5)
 

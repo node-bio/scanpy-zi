@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from .rank_genes import rank_genes_groups_zi
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["rank_genes_groups_zi", "pl", "__version__"]
 
 # Lazy loading for plotting module to avoid matplotlib import on package load
